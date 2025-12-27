@@ -408,7 +408,12 @@ func (h *Handler) listLinkVisits(c *gin.Context) {
 		}
 	}
 
+	inclusive := c.Query("sort") != "" || c.Query("filter") != ""
+
 	limit := to - from
+	if inclusive {
+		limit = to - from + 1
+	}
 	if limit < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid range"})
 		return
