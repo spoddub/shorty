@@ -39,6 +39,15 @@ type linkOut struct {
 	ShortURL    string `json:"short_url"`
 }
 
+type linkVisitOut struct {
+	ID        int64     `json:"id"`
+	LinkID    int64     `json:"link_id"`
+	CreatedAt time.Time `json:"created_at"`
+	IP        string    `json:"ip"`
+	UserAgent string    `json:"user_agent"`
+	Status    int32     `json:"status"`
+}
+
 var shortNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{3,32}$`)
 
 func NewRouter(q *db.Queries, baseURL string) *gin.Engine {
@@ -49,6 +58,10 @@ func NewRouter(q *db.Queries, baseURL string) *gin.Engine {
 
 	r := gin.New()
 
+	r.TrustedPlatform = gin.PlatformCloudflare
+
+	_ = r.SetTrustedProxies([]string{"127.0.0.1", "::1"})
+
 	allowedOrigins := []string{"http://localhost:5173"}
 	if u, err := url.Parse(h.BaseURL); err == nil && u.Scheme != "" && u.Host != "" {
 		allowedOrigins = append(allowedOrigins, u.Scheme+"://"+u.Host)
@@ -57,7 +70,7 @@ func NewRouter(q *db.Queries, baseURL string) *gin.Engine {
 	r.Use(cors.New(cors.Config{
 		AllowOrigins: allowedOrigins,
 		AllowMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders: []string{"Content-Type", "Authorization"},
+		AllowHeaders: []string{"Content-Type", "Authorization", "Range"},
 		ExposeHeaders: []string{
 			"Content-Range",
 		},
@@ -76,7 +89,7 @@ func NewRouter(q *db.Queries, baseURL string) *gin.Engine {
 		c.String(http.StatusOK, "pong")
 	})
 
-	r.GET("/r/:short_name", h.redirectByShortName)
+	r.GET("/r/:code", h.redirectByCode)
 
 	api := r.Group("/api")
 	{
@@ -85,6 +98,8 @@ func NewRouter(q *db.Queries, baseURL string) *gin.Engine {
 		api.GET("/links/:id", h.getLink)
 		api.PUT("/links/:id", h.updateLink)
 		api.DELETE("/links/:id", h.deleteLink)
+
+		api.GET("/link_visits", h.listLinkVisits)
 	}
 
 	return r
@@ -122,12 +137,7 @@ func (h *Handler) listLinks(c *gin.Context) {
 			})
 		}
 
-		if len(out) == 0 {
-			c.Header("Content-Range", fmt.Sprintf("links */%d", total))
-		} else {
-			c.Header("Content-Range", fmt.Sprintf("links 0-%d/%d", len(out)-1, total))
-		}
-
+		setContentRange(c, "links", 0, len(out), total)
 		c.JSON(http.StatusOK, out)
 		return
 	}
@@ -175,14 +185,7 @@ func (h *Handler) listLinks(c *gin.Context) {
 		})
 	}
 
-	if len(out) == 0 {
-		c.Header("Content-Range", fmt.Sprintf("links */%d", total))
-		c.JSON(http.StatusOK, out)
-		return
-	}
-
-	end := from + len(out) - 1
-	c.Header("Content-Range", fmt.Sprintf("links %d-%d/%d", from, end, total))
+	setContentRange(c, "links", from, len(out), total)
 	c.JSON(http.StatusOK, out)
 }
 
@@ -347,14 +350,14 @@ func (h *Handler) deleteLink(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-func (h *Handler) redirectByShortName(c *gin.Context) {
-	shortName := strings.TrimSpace(c.Param("short_name"))
-	if shortName == "" {
+func (h *Handler) redirectByCode(c *gin.Context) {
+	code := strings.TrimSpace(c.Param("code"))
+	if code == "" {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
 
-	row, err := h.Q.GetLinkByShortName(c.Request.Context(), shortName)
+	row, err := h.Q.GetLinkByShortName(c.Request.Context(), code)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
@@ -364,7 +367,91 @@ func (h *Handler) redirectByShortName(c *gin.Context) {
 		return
 	}
 
-	c.Redirect(http.StatusFound, row.OriginalUrl)
+	status := http.StatusFound
+
+	ip := c.ClientIP()
+	ua := c.GetHeader("User-Agent")
+	ref := c.GetHeader("Referer")
+
+	_, _ = h.Q.CreateLinkVisit(c.Request.Context(), db.CreateLinkVisitParams{
+		LinkID:    row.ID,
+		Ip:        ip,
+		UserAgent: ua,
+		Referer:   ref,
+		Status:    int32(status),
+	})
+
+	c.Redirect(status, row.OriginalUrl)
+}
+
+func (h *Handler) listLinkVisits(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	total, err := h.Q.CountLinkVisits(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
+		return
+	}
+
+	rawRange := strings.TrimSpace(c.GetHeader("Range"))
+	if rawRange == "" {
+		rawRange = strings.TrimSpace(c.Query("range"))
+	}
+
+	from, to := 0, 10
+	if rawRange != "" {
+		var ok bool
+		from, to, ok = parseRange(rawRange)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid range"})
+			return
+		}
+	}
+
+	limit := to - from
+	if limit < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid range"})
+		return
+	}
+
+	if total == 0 || limit == 0 || int64(from) >= total {
+		c.Header("Content-Range", fmt.Sprintf("link_visits */%d", total))
+		c.JSON(http.StatusOK, []linkVisitOut{})
+		return
+	}
+
+	rows, err := h.Q.ListLinkVisitsRange(ctx, db.ListLinkVisitsRangeParams{
+		Limit:  int32(limit),
+		Offset: int32(from),
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
+		return
+	}
+
+	out := make([]linkVisitOut, 0, len(rows))
+	for _, v := range rows {
+		out = append(out, linkVisitOut{
+			ID:        v.ID,
+			LinkID:    v.LinkID,
+			CreatedAt: v.CreatedAt.Time.UTC(),
+			IP:        v.Ip,
+			UserAgent: v.UserAgent,
+			Status:    v.Status,
+		})
+	}
+
+	setContentRange(c, "link_visits", from, len(out), total)
+	c.JSON(http.StatusOK, out)
+}
+
+func setContentRange(c *gin.Context, resource string, from int, count int, total int64) {
+	if count <= 0 {
+		c.Header("Content-Range", fmt.Sprintf("%s */%d", resource, total))
+		return
+	}
+	end := from + count - 1
+	c.Header("Content-Range", fmt.Sprintf("%s %d-%d/%d", resource, from, end, total))
 }
 
 func parseRange(raw string) (start, end int, ok bool) {
