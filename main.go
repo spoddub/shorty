@@ -8,6 +8,7 @@ import (
 
 	"github.com/getsentry/sentry-go"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 
 	db "shorty/internal/db/sqlc"
 	httpapi "shorty/internal/http"
@@ -26,6 +27,8 @@ func initSentry() {
 }
 
 func main() {
+	_ = godotenv.Load()
+
 	initSentry()
 	defer sentry.Flush(2 * time.Second)
 
@@ -51,7 +54,6 @@ func main() {
 	defer pool.Close()
 
 	q := db.New(pool)
-
 	router := httpapi.NewRouter(q, baseURL)
 
 	_ = router.Run(":" + port)
