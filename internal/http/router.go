@@ -28,8 +28,8 @@ type Handler struct {
 }
 
 type linkIn struct {
-	OriginalURL string `json:"original_url"`
-	ShortName   string `json:"short_name"`
+	OriginalURL string `json:"original_url" binding:"required,url"`
+	ShortName   string `json:"short_name" binding:"omitempty,shortname"`
 }
 
 type linkOut struct {
@@ -51,6 +51,8 @@ type linkVisitOut struct {
 var shortNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{3,32}$`)
 
 func NewRouter(q *db.Queries, baseURL string) *gin.Engine {
+	setupValidator()
+
 	h := &Handler{
 		Q:       q,
 		BaseURL: strings.TrimRight(baseURL, "/"),
@@ -192,12 +194,7 @@ func (h *Handler) listLinks(c *gin.Context) {
 func (h *Handler) createLink(c *gin.Context) {
 	var in linkIn
 	if err := c.ShouldBindJSON(&in); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
-		return
-	}
-
-	if err := validateOriginalURL(in.OriginalURL); err != nil {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
+		writeBindError(c, err)
 		return
 	}
 
@@ -205,18 +202,13 @@ func (h *Handler) createLink(c *gin.Context) {
 
 	shortName := strings.TrimSpace(in.ShortName)
 	if shortName != "" {
-		if !shortNameRe.MatchString(shortName) {
-			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "short_name is invalid"})
-			return
-		}
-
 		row, err := h.Q.CreateLink(ctx, db.CreateLinkParams{
 			OriginalUrl: in.OriginalURL,
 			ShortName:   shortName,
 		})
 		if err != nil {
 			if isUniqueViolation(err) {
-				c.JSON(http.StatusConflict, gin.H{"error": "short_name already exists"})
+				writeUniqueShortNameError(c)
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
@@ -290,22 +282,27 @@ func (h *Handler) updateLink(c *gin.Context) {
 
 	var in linkIn
 	if err := c.ShouldBindJSON(&in); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
+		writeBindError(c, err)
 		return
 	}
 
-	if err := validateOriginalURL(in.OriginalURL); err != nil {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
-		return
-	}
+	ctx := c.Request.Context()
 
 	shortName := strings.TrimSpace(in.ShortName)
-	if shortName == "" || !shortNameRe.MatchString(shortName) {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "short_name is invalid"})
-		return
+	if shortName == "" {
+		existing, err := h.Q.GetLink(ctx, id)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
+			return
+		}
+		shortName = existing.ShortName
 	}
 
-	row, err := h.Q.UpdateLink(c.Request.Context(), db.UpdateLinkParams{
+	row, err := h.Q.UpdateLink(ctx, db.UpdateLinkParams{
 		ID:          id,
 		OriginalUrl: in.OriginalURL,
 		ShortName:   shortName,
@@ -316,7 +313,7 @@ func (h *Handler) updateLink(c *gin.Context) {
 			return
 		}
 		if isUniqueViolation(err) {
-			c.JSON(http.StatusConflict, gin.H{"error": "short_name already exists"})
+			writeUniqueShortNameError(c)
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "db error"})
@@ -472,24 +469,6 @@ func parseRange(raw string) (start, end int, ok bool) {
 	}
 
 	return arr[0], arr[1], true
-}
-
-func validateOriginalURL(s string) error {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return errors.New("original_url is required")
-	}
-
-	u, err := url.Parse(s)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return errors.New("original_url is invalid")
-	}
-
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return errors.New("original_url must start with http or https")
-	}
-
-	return nil
 }
 
 func isUniqueViolation(err error) bool {
