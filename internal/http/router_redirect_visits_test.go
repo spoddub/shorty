@@ -55,9 +55,10 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	schemaDSN, err = dsnWithSearchPath(baseDSN, schemaName)
-	if err != nil {
-		fmt.Println("build schema DSN failed:", err)
+	var dsnErr error
+	schemaDSN, dsnErr = dsnWithSearchPath(baseDSN, schemaName)
+	if dsnErr != nil {
+		fmt.Println("build schema DSN failed:", dsnErr)
 		_ = dropSchema(baseDSN, schemaName)
 		os.Exit(1)
 	}
@@ -113,7 +114,7 @@ func createSchema(dsn, schema string) error {
 	if err != nil {
 		return err
 	}
-	defer sqlDB.Close()
+	defer func() { _ = sqlDB.Close() }()
 
 	_, err = sqlDB.Exec(`CREATE SCHEMA IF NOT EXISTS ` + quoteIdent(schema))
 	return err
@@ -124,7 +125,7 @@ func dropSchema(dsn, schema string) error {
 	if err != nil {
 		return err
 	}
-	defer sqlDB.Close()
+	defer func() { _ = sqlDB.Close() }()
 
 	_, err = sqlDB.Exec(`DROP SCHEMA IF EXISTS ` + quoteIdent(schema) + ` CASCADE`)
 	return err
@@ -139,7 +140,7 @@ func runMigrations(dsn, dir string) error {
 	if err != nil {
 		return err
 	}
-	defer sqlDB.Close()
+	defer func() { _ = sqlDB.Close() }()
 
 	if err := goose.SetDialect("postgres"); err != nil {
 		return err
@@ -154,6 +155,11 @@ func openSQL(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+
 	return sqlDB
 }
 
@@ -170,6 +176,7 @@ func openPool(t *testing.T) *pgxpool.Pool {
 
 func truncateAll(t *testing.T, sqlDB *sql.DB) {
 	t.Helper()
+
 	_, err := sqlDB.Exec(`TRUNCATE link_visits, links RESTART IDENTITY CASCADE`)
 	if err != nil {
 		t.Fatal(err)
@@ -198,7 +205,6 @@ func newRouter(t *testing.T, pool *pgxpool.Pool) http.Handler {
 
 func TestRedirectCreatesVisit(t *testing.T) {
 	sqlDB := openSQL(t)
-	defer sqlDB.Close()
 
 	truncateAll(t, sqlDB)
 	_ = seedLink(t, sqlDB, "https://example.com/long-url", "exmpl")
@@ -259,7 +265,6 @@ func TestRedirectCreatesVisit(t *testing.T) {
 
 func TestLinkVisitsPagination(t *testing.T) {
 	sqlDB := openSQL(t)
-	defer sqlDB.Close()
 
 	truncateAll(t, sqlDB)
 	linkID := seedLink(t, sqlDB, "https://example.com", "seed")
